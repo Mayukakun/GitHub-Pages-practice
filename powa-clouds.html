@@ -1,0 +1,430 @@
+<!doctype html>
+<html lang="ja">
+<head>
+  <meta charset="utf-8" />
+  <title>powa clouds – refactored</title>
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <style>
+    html,body { margin:0; height:100%; background:#0e1116; overflow:hidden; }
+    canvas { display:block; }
+    .hint {
+      position:fixed; left:12px; bottom:12px; padding:6px 10px; border-radius:12px;
+      font:12px/1.4 system-ui, -apple-system, Segoe UI, Roboto, sans-serif;
+      background:rgba(255,255,255,.08); color:#dfe6ee; backdrop-filter: blur(6px);
+    }
+  </style>
+</head>
+<body>
+  <div class="hint">Drag: rotate / Wheel: zoom / Right-drag: pan / T: time mode</div>
+
+  <script type="module">
+    import * as THREE from "https://unpkg.com/three@0.160.0/build/three.module.js";
+    import { OrbitControls } from "https://unpkg.com/three@0.160.0/examples/jsm/controls/OrbitControls.js?module";
+
+    // =============================
+    // CONFIG & CONSTANTS
+    // =============================
+    const CONFIG = {
+      scene: {
+        clearColor: 0x0e1116,
+        fogDensity: 0.015,
+        floorY: -2.2,
+        floorSize: 400,
+      },
+      time: {
+        mode: 'cycle',          // 'cycle' | 'realtime'
+        cycleSec: 90,           // 周期（cycleモード）
+      },
+      colors: {
+        baseBlue: "#82abb0",
+        baseCream: "#d1bf64",
+      },
+      clouds: {
+        ring: { count: 28, radius: 18, radialJitter: 0.6 },
+        random: { count: 6, area: 6, yMin: 0.5, yMax: 4.5 },
+        clusterCountRange: [3, 8],
+        innerClusterCountRange: [4, 7],
+      },
+      renderer: {
+        pixelRatioMax: 2,
+        powerPreference: 'high-performance',
+      },
+      controls: {
+        damping: 0.06,
+        minDistance: 6,
+        maxDistance: 80,
+      },
+      camera: {
+        fov: 60,
+        near: 0.1,
+        far: 1000,
+        pos: [0, 6, 24],
+      },
+    };
+
+    // =============================
+    // CORE OBJECTS
+    // =============================
+    const scene = new THREE.Scene();
+    scene.fog = new THREE.FogExp2(CONFIG.scene.clearColor, CONFIG.scene.fogDensity);
+
+    const renderer = new THREE.WebGLRenderer({ antialias:true, powerPreference:CONFIG.renderer.powerPreference });
+    renderer.setPixelRatio(Math.min(window.devicePixelRatio, CONFIG.renderer.pixelRatioMax));
+    renderer.setSize(window.innerWidth, window.innerHeight);
+    renderer.setClearColor(CONFIG.scene.clearColor, 1);
+    document.body.appendChild(renderer.domElement);
+
+    const camera = new THREE.PerspectiveCamera(
+      CONFIG.camera.fov,
+      window.innerWidth / window.innerHeight,
+      CONFIG.camera.near,
+      CONFIG.camera.far
+    );
+    camera.position.set(...CONFIG.camera.pos);
+
+    const controls = new OrbitControls(camera, renderer.domElement);
+    controls.enableDamping = true;
+    controls.dampingFactor = CONFIG.controls.damping;
+    controls.minDistance = CONFIG.controls.minDistance;
+    controls.maxDistance = CONFIG.controls.maxDistance;
+
+    // =============================
+    // LIGHTS
+    // =============================
+    const hemi = new THREE.HemisphereLight(0xbcd7ff, 0x223344, 0.9);
+    scene.add(hemi);
+    const dir = new THREE.DirectionalLight(0xffffff, 0.6);
+    dir.position.set(5, 10, 6);
+    scene.add(dir);
+
+    // =============================
+    // ENV (background sphere + floor)
+    // =============================
+    (function initEnv(){
+      const bgGeo = new THREE.SphereGeometry(200, 32, 32);
+      const bgMat = new THREE.MeshBasicMaterial({ color: CONFIG.scene.clearColor, side: THREE.BackSide });
+      scene.add(new THREE.Mesh(bgGeo, bgMat));
+
+      const floorGeo = new THREE.PlaneGeometry(CONFIG.scene.floorSize, CONFIG.scene.floorSize);
+      const floorMat = new THREE.MeshStandardMaterial({ color: 0x121821, roughness: 0.95, metalness: 0.0, transparent: true, opacity: 0.7 });
+      const floor = new THREE.Mesh(floorGeo, floorMat);
+      floor.rotation.x = -Math.PI/2;
+      floor.position.y = CONFIG.scene.floorY;
+      scene.add(floor);
+    })();
+
+    // =============================
+    // TIME & SKY PALETTE
+    // =============================
+    const COL = {
+      dawnSky:   new THREE.Color('#0f1c28'),
+      daySky:    new THREE.Color('#94b7ff'),
+      duskSky:   new THREE.Color('#1a2233'),
+      nightSky:  new THREE.Color('#0b0f14'),
+
+      dawnFog:   new THREE.Color('#10161f'),
+      dayFog:    new THREE.Color('#cfe3ff'),
+      duskFog:   new THREE.Color('#0f1520'),
+      nightFog:  new THREE.Color('#080b10'),
+
+      sunDawn:   new THREE.Color('#ffd6a3'),
+      sunDay:    new THREE.Color('#ffffff'),
+      sunDusk:   new THREE.Color('#ffb38a'),
+      moon:      new THREE.Color('#9fc3ff'),
+
+      hemiSkyDay:new THREE.Color('#bcd7ff'),
+      hemiGndDay:new THREE.Color('#223344'),
+      hemiSkyNight:new THREE.Color('#50607a'),
+      hemiGndNight:new THREE.Color('#0f131a'),
+    };
+
+    let timeMode = CONFIG.time.mode; // 'cycle' | 'realtime'
+    let cycleSec  = CONFIG.time.cycleSec;
+    let tOfDay = 0;                  // 0..1
+    const clock = new THREE.Clock();
+
+    function lerpColor(a,b,t){ return a.clone().lerp(b, t); }
+
+    function applyPowaTime(tNorm){
+      let skyCol, fogCol, sunCol, sunInt, hemiSky, hemiGnd;
+
+      if (tNorm < 0.20) { // dawn
+        const k = tNorm/0.20;
+        skyCol = lerpColor(COL.nightSky, COL.dawnSky, k);
+        fogCol = lerpColor(COL.nightFog, COL.dawnFog, k);
+        sunCol = lerpColor(COL.moon, COL.sunDawn, k);
+        sunInt = THREE.MathUtils.lerp(0.15, 0.65, k);
+        hemiSky = lerpColor(COL.hemiSkyNight, COL.hemiSkyDay, k*0.7);
+        hemiGnd = lerpColor(COL.hemiGndNight, COL.hemiGndDay, k*0.7);
+      } else if (tNorm < 0.50) { // day
+        const k = (tNorm-0.20)/0.30;
+        skyCol = lerpColor(COL.dawnSky, COL.daySky, k);
+        fogCol = lerpColor(COL.dawnFog, COL.dayFog, k);
+        sunCol = lerpColor(COL.sunDawn, COL.sunDay, k);
+        sunInt = THREE.MathUtils.lerp(0.65, 0.95, k);
+        hemiSky = COL.hemiSkyDay;
+        hemiGnd = COL.hemiGndDay;
+      } else if (tNorm < 0.70) { // dusk
+        const k = (tNorm-0.50)/0.20;
+        skyCol = lerpColor(COL.daySky, COL.duskSky, k);
+        fogCol = lerpColor(COL.dayFog, COL.duskFog, k);
+        sunCol = lerpColor(COL.sunDay, COL.sunDusk, k);
+        sunInt = THREE.MathUtils.lerp(0.95, 0.50, k);
+        hemiSky = lerpColor(COL.hemiSkyDay, COL.hemiSkyNight, k*0.7);
+        hemiGnd = lerpColor(COL.hemiGndDay, COL.hemiGndNight, k*0.7);
+      } else { // night
+        const k = (tNorm-0.70)/0.30;
+        skyCol = lerpColor(COL.duskSky, COL.nightSky, k);
+        fogCol = lerpColor(COL.duskFog, COL.nightFog, k);
+        sunCol = lerpColor(COL.sunDusk, COL.moon, k);
+        sunInt = THREE.MathUtils.lerp(0.50, 0.20, k);
+        hemiSky = COL.hemiSkyNight;
+        hemiGnd = COL.hemiGndNight;
+      }
+
+      scene.background = skyCol;
+      scene.fog.color.copy(fogCol);
+
+      hemi.color.copy(hemiSky);
+      hemi.groundColor.copy(hemiGnd);
+
+      dir.color.copy(sunCol);
+      dir.intensity = sunInt;
+
+      const az = tNorm * Math.PI * 2;
+      const el = Math.cos((tNorm-0.25)*Math.PI*2) * 0.6 + 0.2;
+      dir.position.set(Math.cos(az)*8, THREE.MathUtils.clamp(el*10, -3, 9), Math.sin(az)*8);
+    }
+
+    function updateTime(){
+      const dt = clock.getDelta();
+      if (timeMode === 'cycle') {
+        tOfDay = (tOfDay + dt / cycleSec) % 1;
+      } else {
+        const d = new Date();
+        tOfDay = (d.getHours()*3600 + d.getMinutes()*60 + d.getSeconds()) / 86400;
+      }
+      applyPowaTime(tOfDay);
+      return clock.getElapsedTime();
+    }
+
+    window.addEventListener('keydown', (e)=>{
+      if (e.key.toLowerCase() === 't') {
+        timeMode = (timeMode === 'cycle') ? 'realtime' : 'cycle';
+        console.log('timeMode:', timeMode);
+      }
+    });
+
+    // =============================
+    // COLORS & MATERIALS
+    // =============================
+    const baseBlue  = new THREE.Color(CONFIG.colors.baseBlue);
+    const baseCream = new THREE.Color(CONFIG.colors.baseCream);
+
+    function pickPowaColor() {
+      const t = Math.random();
+      const c = baseBlue.clone().lerp(baseCream, t);
+      const hsl = {}; c.getHSL(hsl);
+      hsl.h += (Math.random()-0.5)*0.02;
+      hsl.s = THREE.MathUtils.clamp(hsl.s + (Math.random()-0.5)*0.15, 0.25, 0.8);
+      hsl.l = THREE.MathUtils.clamp(hsl.l + (Math.random()-0.5)*0.15, 0.45, 0.85);
+      c.setHSL(hsl.h, hsl.s, hsl.l);
+      return c;
+    }
+
+    function makeCloudMaterial() {
+      const m = new THREE.MeshStandardMaterial({
+        color: pickPowaColor(),
+        roughness: 0.9,
+        metalness: 0.0,
+        transparent: true,
+        opacity: THREE.MathUtils.randFloat(0.35, 0.6),
+        depthWrite: false,
+        blending: THREE.AdditiveBlending,
+      });
+      // 発光は本体色ベース
+      m.emissive = m.color.clone();
+      m.emissiveIntensity = 0.0;
+      return m;
+    }
+
+    // =============================
+    // CLOUDS
+    // =============================
+    const clouds = new THREE.Group();
+    scene.add(clouds);
+
+    function createPowaCloudCluster(center = new THREE.Vector3(), count = 5) {
+      const group = new THREE.Group();
+      // 各クラスタごとに専用マテリアル（他クラスタと共有しない）
+      const material = makeCloudMaterial();
+
+      for (let i = 0; i < count; i++) {
+        const r = THREE.MathUtils.randFloat(0.8, 2.1);
+        const geo = new THREE.SphereGeometry(r, 24, 16);
+        const mesh = new THREE.Mesh(geo, material);
+        const angle = Math.random() * Math.PI * 2;
+        const dist = THREE.MathUtils.randFloat(0.0, 2.5);
+        const y = THREE.MathUtils.randFloat(-0.6, 0.9);
+        mesh.position.set(Math.cos(angle)*dist, y, Math.sin(angle)*dist);
+        mesh.userData.floatPhase = Math.random() * Math.PI * 2;
+        mesh.userData.floatAmp = THREE.MathUtils.randFloat(0.05, 0.25);
+        group.add(mesh);
+      }
+
+      group.position.copy(center);
+      group.userData.spin = (Math.random()<0.5?-1:1) * THREE.MathUtils.randFloat(0.02, 0.08);
+      group.userData.bobAmp = THREE.MathUtils.randFloat(0.08, 0.22);
+      group.userData.bobPhase = Math.random() * Math.PI * 2;
+      group.scale.setScalar(1);
+      group.userData.pulseActive = false;
+      group.userData.pulseT = 0;
+      group.userData.hover = false; // hover state
+      return group;
+    }
+
+    function spawnCloudsCircular(count, radius){
+      for (let i = 0; i < count; i++) {
+        const a = (i/count)*Math.PI*2 + Math.random()*0.3;
+        const r = radius * (0.6 + Math.random()*CONFIG.clouds.ring.radialJitter);
+        const x = Math.cos(a)*r;
+        const z = Math.sin(a)*r;
+        const y = THREE.MathUtils.randFloat(-1.0, 5.5);
+        const clusterCount = Math.floor(THREE.MathUtils.randFloat(...CONFIG.clouds.clusterCountRange));
+        clouds.add(createPowaCloudCluster(new THREE.Vector3(x,y,z), clusterCount));
+      }
+    }
+
+    function spawnCloudsRandom(count, area){
+      for (let i = 0; i < count; i++) {
+        const p = new THREE.Vector3(
+          THREE.MathUtils.randFloatSpread(area),
+          THREE.MathUtils.randFloat(CONFIG.clouds.random.yMin, CONFIG.clouds.random.yMax),
+          THREE.MathUtils.randFloatSpread(area)
+        );
+        const clusterCount = Math.floor(THREE.MathUtils.randFloat(...CONFIG.clouds.innerClusterCountRange));
+        clouds.add(createPowaCloudCluster(p, clusterCount));
+      }
+    }
+
+    // 初期配置
+    spawnCloudsCircular(CONFIG.clouds.ring.count, CONFIG.clouds.ring.radius);
+    spawnCloudsRandom(CONFIG.clouds.random.count, CONFIG.clouds.random.area);
+
+    // =============================
+    // INTERACTION (hover & click)
+    // =============================
+    const raycaster = new THREE.Raycaster();
+    const pointer = new THREE.Vector2();
+    let hovered = null;
+    let downPos = null;
+
+    function updatePointer(e) {
+      const rect = renderer.domElement.getBoundingClientRect();
+      pointer.x = ((e.clientX - rect.left) / rect.width) * 2 - 1;
+      pointer.y = -((e.clientY - rect.top) / rect.height) * 2 + 1;
+    }
+
+    function getAllCloudMeshes(){
+      const meshes = [];
+      clouds.children.forEach(g => g.children.forEach(m => meshes.push(m)));
+      return meshes;
+    }
+
+    renderer.domElement.addEventListener('pointermove', (e) => {
+      updatePointer(e);
+      raycaster.setFromCamera(pointer, camera);
+      const hit = raycaster.intersectObjects(getAllCloudMeshes(), true)[0];
+      const newGroup = hit ? hit.object.parent : null;
+
+      if (hovered && hovered !== newGroup) hovered.userData.hover = false;
+      if (newGroup && hovered !== newGroup) newGroup.userData.hover = true;
+      hovered = newGroup;
+      renderer.domElement.style.cursor = hovered ? 'pointer' : 'default';
+    }, { passive: true });
+
+    renderer.domElement.addEventListener('pointerdown', (e) => { downPos = { x:e.clientX, y:e.clientY }; });
+
+    renderer.domElement.addEventListener('pointerup', (e) => {
+      if (!downPos) return;
+      const drag = Math.hypot(e.clientX - downPos.x, e.clientY - downPos.y) > 5;
+      downPos = null;
+      if (drag) return; // ドラッグはクリック扱いにしない
+
+      e.stopPropagation(); // OrbitControlsへの伝播を防ぐ
+      raycaster.setFromCamera(pointer, camera);
+      const hit = raycaster.intersectObjects(getAllCloudMeshes(), true)[0];
+      if (!hit) return;
+
+      const group = hit.object.parent;
+      group.userData.pulseActive = true;
+      group.userData.pulseT = 0;
+
+      const mat = group.children[0].material; // クラスタ共通マテリアル
+      mat.emissive = mat.color.clone();
+      mat.emissiveIntensity = 0.0; // animate内で上げる
+    });
+
+    // タッチ操作でスクロールにならないように
+    renderer.domElement.style.touchAction = 'none';
+
+    // =============================
+    // UPDATE (animation)
+    // =============================
+    function updateClouds(t){
+      clouds.children.forEach(group => {
+        // gentle bobbing & spin
+        group.position.y += Math.sin(t*0.7 + group.userData.bobPhase) * group.userData.bobAmp * 0.01;
+        group.rotation.y += group.userData.spin * 0.0015;
+
+        // inner floats
+        group.children.forEach(m => {
+          m.position.y += Math.sin(t*1.2 + m.userData.floatPhase) * m.userData.floatAmp * 0.01;
+        });
+
+        const mat = group.children[0].material; // クラスタ共通マテリアル
+        if (group.userData.pulseActive) {
+          group.userData.pulseT += 0.06;
+          const tt = Math.min(group.userData.pulseT, 1);
+          const s = 1 + 0.6 * Math.sin(tt * Math.PI);
+          group.scale.setScalar(s);
+          mat.emissiveIntensity = 0.4 * Math.sin(tt * Math.PI);
+          if (group.userData.pulseT >= 1) {
+            group.userData.pulseActive = false;
+            group.userData.pulseT = 0;
+            group.scale.setScalar(1);
+            mat.emissiveIntensity = 0.0;
+          }
+        } else {
+          const target = group.userData.hover ? 0.35 : 0.0;
+          mat.emissiveIntensity += (target - mat.emissiveIntensity) * 0.1;
+        }
+      });
+    }
+
+    function animate(){
+      requestAnimationFrame(animate);
+      const t = updateTime();
+      updateClouds(t);
+      controls.update();
+      renderer.render(scene, camera);
+    }
+    animate();
+
+    // =============================
+    // RESIZE & CONTEXT LOST
+    // =============================
+    window.addEventListener("resize", () => {
+      const w = window.innerWidth, h = window.innerHeight;
+      camera.aspect = w / h;
+      camera.updateProjectionMatrix();
+      renderer.setSize(w, h);
+    });
+
+    renderer.domElement.addEventListener('webglcontextlost', (e) => {
+      e.preventDefault();
+      console.warn('WebGL context lost. Close other 3D tabs and reload.');
+    }, false);
+  </script>
+</body>
+</html>
